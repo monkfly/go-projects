@@ -1,0 +1,114 @@
+package api
+
+import (
+	"context"
+	"github.com/gofiber/fiber/v2"
+	"google.golang.org/grpc"
+	"unimapper-go/config"
+	"unimapper-go/logger"
+	pb "unimapper-go/proto/gen"
+)
+
+type ErrMessage struct {
+	Error string `json:"error" xml:"error"`
+}
+
+type Transformer interface {
+	Transform(payload []byte) ([]byte, error)
+}
+
+type redirector interface {
+	Post(headers, body []byte, url string) (respBody []byte, err error)
+}
+
+func XMLTransformerRoute(cfg *config.Config, xmlRequestTransformer Transformer, xmlResponseTransformer Transformer, redirector redirector) fiber.Handler {
+	return commonUsecase(cfg, xmlRequestTransformer, xmlResponseTransformer, fiber.MIMEApplicationXML, redirector)
+}
+
+func JSONTransformerRoute(cfg *config.Config, jsonRequestTransformer Transformer, jsonResponseTransformer Transformer, redirector redirector) fiber.Handler {
+	return commonUsecase(cfg, jsonRequestTransformer, jsonResponseTransformer, fiber.MIMEApplicationJSON, redirector)
+}
+
+func ProtobufTransformerRoute() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		logger.Logger().Debug("получен запрос маппинг GRPC -> PROTOBUF:")
+		logger.Logger().Debug(string(c.Body()))
+		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+		conn, err := grpc.Dial("localhost:50051", grpc.WithInsecure())
+		if err != nil {
+			logger.Logger().Error(err.Error())
+			c.Status(500)
+			return c.JSON(ErrMessage{Error: err.Error()})
+		}
+		defer conn.Close()
+
+		client := pb.NewTransformerClient(conn)
+		resp, err := client.Transform(context.Background(), &pb.RequestTransform{Body: string(c.Body())})
+		if err != nil {
+			logger.Logger().Error(err.Error())
+			c.Status(500)
+			return c.JSON(ErrMessage{Error: err.Error()})
+		}
+		logger.Logger().Debug("запрос трансформирован")
+		logger.Logger().Debug("трансформированный ответ отправлен получателю")
+		return c.Send([]byte(resp.Body))
+	}
+}
+
+func commonUsecase(cfg *config.Config, requestTransformer Transformer, responseTransformer Transformer, contentType string, redirector redirector) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		switch contentType {
+		case fiber.MIMEApplicationJSON:
+			logger.Logger().Debug("получен запрос маппинг HTTP -> JSON:")
+		case fiber.MIMEApplicationXML:
+			logger.Logger().Debug("получен запрос маппинг HTTP -> XML:")
+		}
+		c.Set(fiber.HeaderContentType, contentType)
+		logger.Logger().Debug(string(c.Body()))
+		output, err := requestTransformer.Transform(c.Body())
+		logger.Logger().Debug("трансформированный запрос:")
+		logger.Logger().Debug(string(output))
+		if err != nil {
+			logger.Logger().Error(err.Error())
+			c.Status(500)
+			return c.JSON(ErrMessage{Error: err.Error()})
+		}
+
+		redirectUrl := c.Get("REDIRECT_SERVICE")
+		// если не указан URL для перенаправления, то отвечаем преобразованным запросаом
+		if len(redirectUrl) == 0 {
+			logger.Logger().Debug("запрос трансформирован (без отправки в редирект сервис)")
+			return c.Send(output)
+		}
+
+		// если в заголовке указан URL перенаправления преобразованного
+		// запроса, то отправляем с теми же заголовками
+		headers := c.Request().Header.RawHeaders()
+		logger.Logger().Debug("отправка трансформированного запроса в редирект сервис: " + redirectUrl)
+		redirectResponse, err := redirector.Post(headers, output, redirectUrl)
+		if err != nil {
+			logger.Logger().Error(err.Error())
+			c.Status(500)
+			return c.JSON(ErrMessage{Error: err.Error()})
+		}
+
+		logger.Logger().Debug("получен ответ от редирект сервиса:")
+		logger.Logger().Debug(string(redirectResponse))
+		// если стоит трансформация ответа, то трансформируем
+		// ответ и отвечаем
+		if cfg.TransformResponse {
+			logger.Logger().Debug("трансформация ответа...")
+			outputResponse, err := responseTransformer.Transform(redirectResponse)
+			if err != nil {
+				logger.Logger().Error(err.Error())
+				c.Status(500)
+				return c.JSON(ErrMessage{Error: err.Error()})
+			}
+			logger.Logger().Debug("трансформированный ответ отправлен получателю")
+			return c.Send(outputResponse)
+		}
+
+		logger.Logger().Debug("ответ отправлен получателю (без трансформации)")
+		return c.Send(redirectResponse)
+	}
+}
