@@ -1,7 +1,7 @@
 package main
 
 import (
-	"keywords/internal/app"
+	"go-projects/keywords/internal/app"
 )
 
 func main() {
